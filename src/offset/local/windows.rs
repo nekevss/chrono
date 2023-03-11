@@ -190,7 +190,7 @@ fn file_time_as_u64(ft: &FILETIME) -> u64 {
 
 fn file_time_to_unix_seconds(ft: &FILETIME) -> i64 {
     let t = file_time_as_u64(ft) as i64;
-    ((t - HECTONANOSEC_TO_UNIX_EPOCH) / HECTONANOSECS_IN_SEC) as i64
+    (t - HECTONANOSEC_TO_UNIX_EPOCH) / HECTONANOSECS_IN_SEC
 }
 
 fn system_time_to_file_time(sys: &SYSTEMTIME) -> FILETIME {
