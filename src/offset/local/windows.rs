@@ -8,21 +8,15 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::io;
-use std::mem;
-use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::result::Result;
+use std::io::Error;
 
-use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Foundation::SYSTEMTIME;
-use windows_sys::Win32::System::Time::FileTimeToSystemTime;
-use windows_sys::Win32::System::Time::GetTimeZoneInformation;
-use windows_sys::Win32::System::Time::SystemTimeToFileTime;
-use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
-use windows_sys::Win32::System::Time::TzSpecificLocalTimeToSystemTime;
+use super::windows_sys::{WinFileTime, WinSystemTime, WinTimeZoneInfo};
 
 use super::{FixedOffset, Local};
 use crate::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+
 
 pub(super) fn now() -> DateTime<Local> {
     let datetime = tm_to_datetime(Timespec::now().local());
@@ -37,7 +31,7 @@ pub(super) fn naive_to_local(d: &NaiveDateTime, local: bool) -> LocalResult<Date
         tm_hour: d.hour() as i32,
         tm_mday: d.day() as i32,
         tm_mon: d.month0() as i32, // yes, C is that strange...
-        tm_year: d.year() - 1900,  // this doesn't underflow, we know that d is `NaiveDateTime`.
+        tm_year: d.year() - 1900, // this doesn't underflow, we know that d is `NaiveDateTime`.
         tm_wday: 0,                // to_local ignores this
         tm_yday: 0,                // and this
         tm_isdst: -1,
@@ -49,8 +43,18 @@ pub(super) fn naive_to_local(d: &NaiveDateTime, local: bool) -> LocalResult<Date
 
     let spec = Timespec {
         sec: match local {
-            false => utc_tm_to_time(&tm),
-            true => local_tm_to_time(&tm),
+            false => {
+                match tm.utc_to_time() {
+                    Ok(sec) => sec,
+                    Err(_) => return LocalResult::None,
+                }
+            }
+            true => {
+                match tm.local_to_time() {
+                    Ok(sec) => sec,
+                    Err(_) => return LocalResult::None,
+                }
+            }
         },
         nsec: tm.tm_nsec,
     };
@@ -62,6 +66,8 @@ pub(super) fn naive_to_local(d: &NaiveDateTime, local: bool) -> LocalResult<Date
 
     tm_to_datetime(tm)
 }
+
+
 
 /// Converts a `time::Tm` struct into the timezone-aware `DateTime`.
 fn tm_to_datetime(mut tm: Tm) -> LocalResult<DateTime<Local>> {
@@ -111,28 +117,14 @@ impl Timespec {
 
     /// Converts this timespec into the system's local time.
     fn local(self) -> Tm {
-        let mut tm = Tm {
-            tm_sec: 0,
-            tm_min: 0,
-            tm_hour: 0,
-            tm_mday: 0,
-            tm_mon: 0,
-            tm_year: 0,
-            tm_wday: 0,
-            tm_yday: 0,
-            tm_isdst: 0,
-            tm_utcoff: 0,
-            tm_nsec: 0,
-        };
-        time_to_local_tm(self.sec, &mut tm);
-        tm.tm_nsec = self.nsec;
-        tm
+        Tm::from_timespec(self)
     }
 }
 
 /// Holds a calendar date and time broken down into its components (year, month,
 /// day, and so on), also called a broken-down time value.
 // FIXME: use c_int instead of i32?
+#[derive(Default)]
 #[repr(C)]
 struct Tm {
     /// Seconds after the minute - [0, 60]
@@ -176,116 +168,85 @@ struct Tm {
     tm_nsec: i32,
 }
 
-const HECTONANOSECS_IN_SEC: i64 = 10_000_000;
-const HECTONANOSEC_TO_UNIX_EPOCH: i64 = 11_644_473_600 * HECTONANOSECS_IN_SEC;
-
-fn time_to_file_time(sec: i64) -> FILETIME {
-    let t = ((sec * HECTONANOSECS_IN_SEC) + HECTONANOSEC_TO_UNIX_EPOCH) as u64;
-    FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 }
-}
-
-fn file_time_as_u64(ft: &FILETIME) -> u64 {
-    ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
-}
-
-fn file_time_to_unix_seconds(ft: &FILETIME) -> i64 {
-    let t = file_time_as_u64(ft) as i64;
-    ((t - HECTONANOSEC_TO_UNIX_EPOCH) / HECTONANOSECS_IN_SEC) as i64
-}
-
-fn system_time_to_file_time(sys: &SYSTEMTIME) -> FILETIME {
-    unsafe {
-        let mut ft = mem::zeroed();
-        SystemTimeToFileTime(sys, &mut ft);
-        ft
+impl Tm {
+    /// # Panics
+    ///
+    /// Can panic if Window's SystemCall fails.
+    pub(crate) fn from_timespec(timespec: Timespec) -> Self {
+        let mut tm = Self::default();
+        tm.update_from_seconds(timespec.sec).unwrap();
+        tm.tm_nsec = timespec.nsec;
+        tm
     }
-}
 
-fn tm_to_system_time(tm: &Tm) -> SYSTEMTIME {
-    let mut sys: SYSTEMTIME = unsafe { mem::zeroed() };
-    sys.wSecond = tm.tm_sec as u16;
-    sys.wMinute = tm.tm_min as u16;
-    sys.wHour = tm.tm_hour as u16;
-    sys.wDay = tm.tm_mday as u16;
-    sys.wDayOfWeek = tm.tm_wday as u16;
-    sys.wMonth = (tm.tm_mon + 1) as u16;
-    sys.wYear = (tm.tm_year + 1900) as u16;
-    sys
-}
+    // TODO: consider changing to update_ from set_
+    pub(crate) fn update_from_seconds(&mut self, sec: i64) -> Result<(), Error> {
+            let filetime = WinFileTime::from_seconds(sec);
+            let utc = filetime.as_system_time()?;
+            let local = utc.as_time_zone_specific()?;
+            self.update_from_system_time(&local);
 
-fn system_time_to_tm(sys: &SYSTEMTIME, tm: &mut Tm) {
-    tm.tm_sec = sys.wSecond as i32;
-    tm.tm_min = sys.wMinute as i32;
-    tm.tm_hour = sys.wHour as i32;
-    tm.tm_mday = sys.wDay as i32;
-    tm.tm_wday = sys.wDayOfWeek as i32;
-    tm.tm_mon = (sys.wMonth - 1) as i32;
-    tm.tm_year = (sys.wYear - 1900) as i32;
-    tm.tm_yday = yday(tm.tm_year, tm.tm_mon + 1, tm.tm_mday);
+            let local_filetime = local.as_file_time()?;
+            let local_sec = local_filetime.as_unix_seconds();
 
-    fn yday(year: i32, month: i32, day: i32) -> i32 {
-        let leap = if month > 2 {
-            if year % 4 == 0 {
-                1
-            } else {
-                2
-            }
-        } else {
-            0
-        };
-        let july = i32::from(month > 7);
+            let tz = WinTimeZoneInfo::new()?;
 
-        (month - 1) * 30 + month / 2 + (day - 1) - leap + july
-    }
-}
-
-macro_rules! call {
-    ($name:ident($($arg:expr),*)) => {
-        if $name($($arg),*) == 0 {
-            panic!(concat!(stringify!($name), " failed with: {}"),
-                    io::Error::last_os_error());
+            // SystemTimeToTzSpecificLocalTime already applied the biases so
+            // check if it non standard
+            self.tm_utcoff = (local_sec - sec) as i32;
+            self.tm_isdst = if self.tm_utcoff == -60 * (tz.bias() + tz.standard_bias()) { 0 } else { 1 };
+            Ok(())
         }
+
+    pub(crate) fn update_from_system_time(&mut self, sys: &WinSystemTime) {
+        self.tm_sec = sys.inner().wSecond as i32;
+        self.tm_min = sys.inner().wMinute as i32;
+        self.tm_hour = sys.inner().wHour as i32;
+        self.tm_mday = sys.inner().wDay as i32;
+        self.tm_wday = sys.inner().wDayOfWeek as i32;
+        self.tm_mon = (sys.inner().wMonth - 1) as i32;
+        self.tm_year = (sys.inner().wYear as i32) - 1900;
+        self.tm_yday = yday(self.tm_year, self.tm_mon + 1, self.tm_mday);
+    }
+
+    pub(crate) fn as_system_time(&self) -> WinSystemTime {
+        let mut sys = WinSystemTime::new();
+        sys.mut_inner().wSecond = self.tm_sec as u16;
+        sys.mut_inner().wMinute = self.tm_min as u16;
+        sys.mut_inner().wHour = self.tm_hour as u16;
+        sys.mut_inner().wDay = self.tm_mday as u16;
+        sys.mut_inner().wDayOfWeek = self.tm_wday as u16;
+        sys.mut_inner().wMonth = (self.tm_mon + 1) as u16;
+        sys.mut_inner().wYear = (self.tm_year + 1900) as u16;
+        sys
+    }
+
+    fn utc_to_time(&self) -> Result<i64, Error> {
+        let sys_time = self.as_system_time();
+        let filetime = sys_time.as_file_time()?;
+        Ok(filetime.as_unix_seconds())
+    }
+
+    fn local_to_time(&self) -> Result<i64, Error> {
+        let sys_time = self.as_system_time();
+        let utc = WinSystemTime::from_local_time(&sys_time)?;
+        let filetime = utc.as_file_time()?;
+        Ok(filetime.as_unix_seconds())
     }
 }
 
-fn time_to_local_tm(sec: i64, tm: &mut Tm) {
-    let ft = time_to_file_time(sec);
-    unsafe {
-        let mut utc = mem::zeroed();
-        let mut local = mem::zeroed();
-        call!(FileTimeToSystemTime(&ft, &mut utc));
-        call!(SystemTimeToTzSpecificLocalTime(ptr::null(), &utc, &mut local));
-        system_time_to_tm(&local, tm);
+fn yday(year: i32, month: i32, day: i32) -> i32 {
+    let leap = if month > 2 {
+        if year % 4 == 0 {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+    let july = i32::from(month > 7);
 
-        let local = system_time_to_file_time(&local);
-        let local_sec = file_time_to_unix_seconds(&local);
-
-        let mut tz = mem::zeroed();
-        GetTimeZoneInformation(&mut tz);
-
-        // SystemTimeToTzSpecificLocalTime already applied the biases so
-        // check if it non standard
-        tm.tm_utcoff = (local_sec - sec) as i32;
-        tm.tm_isdst = if tm.tm_utcoff == -60 * (tz.Bias + tz.StandardBias) { 0 } else { 1 };
-    }
+    (month - 1) * 30 + month / 2 + (day - 1) - leap + july
 }
 
-fn utc_tm_to_time(tm: &Tm) -> i64 {
-    unsafe {
-        let mut ft = mem::zeroed();
-        let sys_time = tm_to_system_time(tm);
-        call!(SystemTimeToFileTime(&sys_time, &mut ft));
-        file_time_to_unix_seconds(&ft)
-    }
-}
-
-fn local_tm_to_time(tm: &Tm) -> i64 {
-    unsafe {
-        let mut ft = mem::zeroed();
-        let mut utc = mem::zeroed();
-        let sys_time = tm_to_system_time(tm);
-        call!(TzSpecificLocalTimeToSystemTime(ptr::null(), &sys_time, &mut utc));
-        call!(SystemTimeToFileTime(&utc, &mut ft));
-        file_time_to_unix_seconds(&ft)
-    }
-}
